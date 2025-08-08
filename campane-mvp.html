@@ -1,0 +1,406 @@
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Simulatore Campane — MVP</title>
+  <style>
+    html, body { margin: 0; padding: 0; height: 100%; background: #0e0f12; color: #e6e7eb; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+    #app { position: relative; width: 100%; height: 100%; overflow: hidden; }
+    #hud { position: absolute; top: 12px; left: 12px; background: rgba(0,0,0,0.5); padding: 10px 12px; border-radius: 8px; font-size: 14px; line-height: 1.45; }
+    #hud .row { margin: 4px 0; }
+    #hud kbd { background: #1f2229; padding: 2px 6px; border-radius: 4px; border: 1px solid #2a2f39; font-size: 13px; }
+    #hud .active { color: #87d1ff; }
+    #startOverlay { position: absolute; inset: 0; display: grid; place-items: center; background: rgba(0,0,0,0.70); }
+    #startOverlay button { font-size: 16px; padding: 12px 18px; border-radius: 10px; border: 1px solid #3a3f4a; background: #1e222b; color: #e6e7eb; cursor: pointer; }
+    #toast { position: absolute; bottom: 14px; left: 50%; transform: translateX(-50%); background: rgba(0,0,0,0.6); padding: 8px 12px; border-radius: 8px; font-size: 13px; display: none; }
+  </style>
+  <!--
+    ISTRUZIONI ASSET AUDIO (realismo)
+    - Per ogni campana servono almeno 3 layer di dinamica (p, mf, f) e 2 varianti per evitare effetto mitraglia.
+    - Nomi file suggeriti:
+      /assets/audio/bell1_p_1.wav
+      /assets/audio/bell1_p_2.wav
+      /assets/audio/bell1_mf_1.wav
+      /assets/audio/bell1_mf_2.wav
+      /assets/audio/bell1_f_1.wav
+      /assets/audio/bell1_f_2.wav
+      ... ripeti per bell2, bell3, bell4, bell5
+    - Facoltativo (consigliato): impulse response per riverbero in campanile
+      /assets/ir/belltower.wav
+
+    COME AVVIARE
+    - Per evitare problemi di CORS nel caricamento file, usa un server statico locale (es. "npx http-server" nella cartella del progetto)
+    - Clicca "Avvia" per sbloccare l'audio del browser.
+
+    TASTI
+    - 1–5: seleziona campana
+    - Frecce ←/→: applica coppia (rotazione)
+    - Spazio: martelletto sulla campana selezionata
+    - Tab: campana successiva
+    - R: reset
+    - M: mute globale
+  -->
+</head>
+<body>
+<div id="app"></div>
+<div id="hud">
+  <div class="row">Campana selezionata: <span id="sel" class="active">1</span></div>
+  <div class="row">Tasti: <kbd>1–5</kbd> seleziona • <kbd>←</kbd>/<kbd>→</kbd> spingi • <kbd>Spazio</kbd> martelletto • <kbd>Tab</kbd> avanti • <kbd>R</kbd> reset • <kbd>M</kbd> mute</div>
+  <div class="row">Suggerimento: tieni premuta una freccia per far "volteggiare" la campana</div>
+</div>
+<div id="startOverlay"><button id="startBtn">Avvia</button></div>
+<div id="toast"></div>
+
+<script type="module">
+  import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
+  import { OrbitControls } from 'https://unpkg.com/three@0.160.0/examples/jsm/controls/OrbitControls.js';
+</script>
+<script src="https://unpkg.com/tone@14.8.49/build/Tone.js"></script>
+<script type="module">
+  // ======== CONFIG ========
+  const BELL_COUNT = 5;
+  const MAX_OMEGA = 6.0;            // rad/s limite sicurezza
+  const FRICTION = 0.45;            // attrito viscoso (maggiore = si ferma prima)
+  const TORQUE_IMPULSE = 9.0;       // intensità coppia da tastiera
+  const HIT_ANGLE = 0.65;           // rad: angolo a cui il battaglio colpisce (±HIT_ANGLE)
+  const HIT_OMEGA_MIN = 1.2;        // rad/s minimo per far scoccare un colpo in rotazione
+  const HAMMER_COOLDOWN = 0.12;     // s tra colpi col martelletto
+  const MASTER_GAIN_DB = -6;        // limite volume globale
+
+  // Mappa file audio per ogni campana e layer
+  // Sostituisci i percorsi con i tuoi campioni realistici
+  const audioMap = Array.from({ length: BELL_COUNT }, (_, i) => {
+    const n = i + 1;
+    return {
+      p: [`assets/audio/bell${n}_p_1.wav`, `assets/audio/bell${n}_p_2.wav`],
+      mf:[`assets/audio/bell${n}_mf_1.wav`, `assets/audio/bell${n}_mf_2.wav`],
+      f: [`assets/audio/bell${n}_f_1.wav`, `assets/audio/bell${n}_f_2.wav`],
+    };
+  });
+
+  // ======== AUDIO SETUP (Tone.js) ========
+  const master = new Tone.Gain(Tone.gainToDb ? 1 : 1).toDestination();
+  // Limita volume globale
+  const masterVol = new Tone.Volume(MASTER_GAIN_DB).connect(master);
+
+  // Riverbero a convoluzione (se IR presente)
+  let conv = null;
+  async function setupConvolver() {
+    try {
+      const irUrl = 'assets/ir/belltower.wav';
+      await fetch(irUrl, { method: 'HEAD' });
+      conv = new Tone.Convolver(irUrl).connect(masterVol);
+      toast('Riverbero campanile attivo');
+    } catch (e) {
+      conv = null; // IR assente, bypass
+    }
+  }
+
+  // Player pool per campioni di ogni campana/layer
+  const players = [];
+  async function loadPlayers() {
+    for (let i = 0; i < BELL_COUNT; i++) {
+      const bell = { p: [], mf: [], f: [] };
+      for (const layer of ['p','mf','f']) {
+        for (const url of audioMap[i][layer]) {
+          const player = new Tone.Player({ url, autostart: false, loop: false }).toDestination();
+          // routing: player -> (conv?) -> masterVol -> master
+          if (conv) player.connect(conv); else player.connect(masterVol);
+          bell[layer].push(player);
+        }
+      }
+      players.push(bell);
+    }
+  }
+
+  function pickRoundRobin(arr) {
+    // semplice round robin: ruota l'array
+    const p = arr.shift();
+    arr.push(p);
+    return p;
+  }
+
+  function strikeBell(i, velocity01 = 0.8) {
+    const bell = players[i];
+    if (!bell) return;
+    // Mappa velocità a layer
+    let layer = 'p';
+    if (velocity01 > 0.75) layer = 'f';
+    else if (velocity01 > 0.45) layer = 'mf';
+
+    const player = pickRoundRobin(bell[layer]);
+    // Regola volume relativo al layer e velocity
+    const vol = new Tone.Gain(velocity01).connect(conv ? conv : masterVol);
+    player.connect(vol);
+    player.start();
+
+    // Rilascio dopo la riproduzione
+    setTimeout(() => vol.dispose(), 3000);
+  }
+
+  // ======== 3D SCENA (Three.js) ========
+  const app = document.getElementById('app');
+  const selEl = document.getElementById('sel');
+  const toastEl = document.getElementById('toast');
+
+  const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  app.appendChild(renderer.domElement);
+
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x0e0f12);
+
+  const camera = new THREE.PerspectiveCamera(45, window.innerWidth/window.innerHeight, 0.1, 100);
+  camera.position.set(0, 2.2, 7.5);
+
+  const controls = new OrbitControls(camera, renderer.domElement);
+  controls.enableDamping = true;
+  controls.enablePan = false;
+  controls.minDistance = 4; controls.maxDistance = 12;
+
+  // Luci
+  const hemi = new THREE.HemisphereLight(0xffffff, 0x222233, 0.8);
+  scene.add(hemi);
+  const dir = new THREE.DirectionalLight(0xffffff, 1.0); dir.position.set(5, 10, 7);
+  scene.add(dir);
+
+  // Pavimento
+  const floorGeo = new THREE.CircleGeometry(20, 64);
+  const floorMat = new THREE.MeshStandardMaterial({ color: 0x151820, roughness: 0.9, metalness: 0.0 });
+  const floor = new THREE.Mesh(floorGeo, floorMat); floor.rotation.x = -Math.PI/2; floor.position.y = -0.01;
+  scene.add(floor);
+
+  // Struttura cella semplice
+  const frame = new THREE.Group();
+  scene.add(frame);
+
+  const postMat = new THREE.MeshStandardMaterial({ color: 0x444c59, roughness: 0.8, metalness: 0.2 });
+  const beamMat = new THREE.MeshStandardMaterial({ color: 0x6b4b2a, roughness: 0.7, metalness: 0.05 });
+
+  function mkBeam(w, h, d, colorMat = beamMat) {
+    const g = new THREE.BoxGeometry(w, h, d);
+    const m = colorMat;
+    const mesh = new THREE.Mesh(g, m);
+    mesh.castShadow = mesh.receiveShadow = true;
+    return mesh;
+  }
+
+  // 2 pilastri + 1 trave superiore
+  const postL = mkBeam(0.25, 3, 0.25, postMat); postL.position.set(-3, 1.5, 0);
+  const postR = mkBeam(0.25, 3, 0.25, postMat); postR.position.set(3, 1.5, 0);
+  const beamTop = mkBeam(6.5, 0.3, 0.6, beamMat); beamTop.position.set(0, 3, 0);
+  frame.add(postL, postR, beamTop);
+
+  // Campane
+  function makeBellMesh(scale=1) {
+    // Geometria "campana" approssimata con LatheGeometry
+    const points = [];
+    const r = 0.5 * scale;
+    points.push(new THREE.Vector2(r*0.1, 0.0));
+    points.push(new THREE.Vector2(r*0.2, 0.1*scale));
+    points.push(new THREE.Vector2(r*0.5, 0.2*scale));
+    points.push(new THREE.Vector2(r*0.65, 0.5*scale));
+    points.push(new THREE.Vector2(r*0.75, 0.8*scale));
+    points.push(new THREE.Vector2(r*0.8, 1.0*scale));
+    points.push(new THREE.Vector2(r*0.78, 1.2*scale));
+    points.push(new THREE.Vector2(r*0.7, 1.35*scale));
+    points.push(new THREE.Vector2(r*0.55, 1.45*scale));
+
+    const geo = new THREE.LatheGeometry(points, 48);
+    const mat = new THREE.MeshStandardMaterial({ color: 0xb0894f, metalness: 0.7, roughness: 0.35 });
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.castShadow = mesh.receiveShadow = true;
+    // Aggiungi batacchio semplificato
+    const batGeo = new THREE.SphereGeometry(0.09*scale, 24, 16);
+    const batMat = new THREE.MeshStandardMaterial({ color: 0x333333, metalness: 0.1, roughness: 0.9 });
+    const bat = new THREE.Mesh(batGeo, batMat);
+    bat.position.set(0, 0.8*scale, 0);
+    mesh.add(bat);
+    return mesh;
+  }
+
+  // Modello campana: gruppo con perno di rotazione (asse X)
+  function createBell(scale=1) {
+    const group = new THREE.Group();
+    const yoke = mkBeam(0.5*scale, 0.2*scale, 0.8*scale, beamMat);
+    yoke.position.set(0, 0.9*scale, 0);
+    const bell = makeBellMesh(scale);
+    bell.position.set(0, 0, 0);
+    // posizioniamo il pivot per ruotare attorno a X alla quota della "spalla" della campana
+    const pivot = new THREE.Group();
+    pivot.position.set(0, 1.05*scale, 0);
+    pivot.add(bell);
+    group.add(pivot, yoke);
+
+    return { group, pivot, bell };
+  }
+
+  // Stato simulazione per ogni campana
+  const bells = [];
+  const bellSpacing = 1.5;
+  for (let i = 0; i < BELL_COUNT; i++) {
+    const scale = 1.0 + (BELL_COUNT - i - 1) * 0.15; // campana 1 più grande, 5 più piccola
+    const { group, pivot, bell } = createBell(scale);
+    group.position.set((i - (BELL_COUNT-1)/2) * bellSpacing, 1.2, 0);
+
+    // highlight selezione
+    const ringGeo = new THREE.TorusGeometry(0.7*scale, 0.02, 16, 64);
+    const ringMat = new THREE.MeshBasicMaterial({ color: 0x87d1ff });
+    const ring = new THREE.Mesh(ringGeo, ringMat);
+    ring.rotation.x = Math.PI/2; ring.position.y = -0.1*scale; ring.visible = (i===0);
+    group.add(ring);
+
+    scene.add(group);
+
+    bells.push({
+      i,
+      group, pivot, bell, ring,
+      theta: 0,            // angolo (rad)
+      omega: 0,            // velocità angolare (rad/s)
+      pushDir: 0,          // -1, 0, +1 da tastiera
+      lastHitSign: 0,      // per rilevare attraversamento soglia
+      lastHammerAt: 0,
+    });
+  }
+
+  // ======== INPUT TASTIERA ========
+  let selected = 0;
+  function updateSelection(idx) {
+    selected = (idx + BELL_COUNT) % BELL_COUNT;
+    for (let i = 0; i < bells.length; i++) bells[i].ring.visible = (i === selected);
+    selEl.textContent = (selected + 1).toString();
+  }
+
+  const keyState = new Set();
+  window.addEventListener('keydown', (e) => {
+    if (e.repeat) return;
+    keyState.add(e.code);
+
+    // Selezione campana 1–5
+    if (/Digit[1-5]/.test(e.code)) {
+      const n = parseInt(e.code.slice(-1), 10) - 1;
+      updateSelection(n);
+      return;
+    }
+
+    if (e.code === 'Tab') { e.preventDefault(); updateSelection(selected + 1); }
+
+    // Rotazione: frecce
+    if (e.code === 'ArrowLeft')  bells[selected].pushDir = -1;
+    if (e.code === 'ArrowRight') bells[selected].pushDir = +1;
+
+    // Martelletto: spazio
+    if (e.code === 'Space') {
+      e.preventDefault();
+      const b = bells[selected];
+      const now = Tone.now();
+      if (now - b.lastHammerAt > HAMMER_COOLDOWN) {
+        b.lastHammerAt = now;
+        strikeBell(b.i, 0.9); // colpo deciso
+      }
+    }
+
+    // Reset
+    if (e.code === 'KeyR') {
+      for (const b of bells) { b.theta = 0; b.omega = 0; b.lastHitSign = 0; }
+    }
+
+    // Mute
+    if (e.code === 'KeyM') {
+      Tone.Destination.mute = !Tone.Destination.mute;
+      toast(Tone.Destination.mute ? 'Audio disattivato (M)' : 'Audio attivo');
+    }
+  });
+
+  window.addEventListener('keyup', (e) => {
+    keyState.delete(e.code);
+    if (e.code === 'ArrowLeft'  && bells[selected].pushDir === -1) bells[selected].pushDir = 0;
+    if (e.code === 'ArrowRight' && bells[selected].pushDir === +1) bells[selected].pushDir = 0;
+  });
+
+  // ======== LOOP FISICO ========
+  let lastTime = performance.now();
+  function tick() {
+    const now = performance.now();
+    const dt = Math.min(0.033, (now - lastTime) / 1000); // clamp a 33ms
+    lastTime = now;
+
+    // Aggiorna ogni campana
+    for (const b of bells) {
+      // Coppia input da tastiera
+      const torque = TORQUE_IMPULSE * b.pushDir;
+      b.omega += torque * dt;
+
+      // Attrito viscoso
+      b.omega -= Math.sign(b.omega) * FRICTION * dt * Math.abs(b.omega);
+
+      // Clamp velocità
+      b.omega = Math.max(-MAX_OMEGA, Math.min(MAX_OMEGA, b.omega));
+
+      // Integrazione
+      b.theta += b.omega * dt;
+
+      // Rotazione mesh attorno ad asse X
+      b.pivot.rotation.x = b.theta;
+
+      // Rilevamento colpo da volteo: quando supera ±HIT_ANGLE con omega sufficiente e cambiamento di segno
+      const sign = Math.sign(Math.sin(b.theta)); // lato della campana
+      const absAngle = Math.abs((b.theta) % (2*Math.PI));
+      const atHitPos = (Math.abs(Math.abs(Math.sin(b.theta)) - Math.sin(HIT_ANGLE)) < 0.02) || (Math.abs(Math.abs(b.theta % (2*Math.PI)) - HIT_ANGLE) < 0.02);
+
+      const crossesPos = (
+        (b.lastHitSign <= 0 && sign > 0 && Math.abs(b.theta % (2*Math.PI)) > HIT_ANGLE) ||
+        (b.lastHitSign >= 0 && sign < 0 && Math.abs(b.theta % (2*Math.PI)) > HIT_ANGLE)
+      );
+
+      if (Math.abs(b.omega) > HIT_OMEGA_MIN && crossesPos) {
+        const velNorm = Math.min(1, Math.abs(b.omega)/MAX_OMEGA);
+        strikeBell(b.i, 0.4 + 0.6*velNorm);
+      }
+      b.lastHitSign = sign;
+    }
+
+    controls.update();
+    renderer.render(scene, camera);
+    requestAnimationFrame(tick);
+  }
+
+  // ======== UI/UTIL ========
+  function toast(msg) {
+    toastEl.textContent = msg;
+    toastEl.style.display = 'block';
+    clearTimeout(toast._t);
+    toast._t = setTimeout(() => toastEl.style.display = 'none', 1400);
+  }
+
+  // ======== STARTUP AUDIO ========
+  const startBtn = document.getElementById('startBtn');
+  startBtn.addEventListener('click', async () => {
+    try {
+      await Tone.start();
+      await setupConvolver();
+      await loadPlayers();
+      document.getElementById('startOverlay').style.display = 'none';
+      toast('Pronto. Seleziona una campana (1–5) e usa ←/→ o Spazio');
+      lastTime = performance.now();
+      tick();
+    } catch (e) {
+      console.error(e);
+      alert('Errore avvio audio o caricamento file. Controlla i percorsi in audioMap e l\'IR opzionale.');
+    }
+  });
+
+  // Resize
+  window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  });
+
+  // Seleziona campana 1 all'avvio
+  updateSelection(0);
+</script>
+</body>
+</html>
